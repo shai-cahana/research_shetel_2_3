@@ -20,6 +20,7 @@ import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+from matplotlib import transforms
 from matplotlib.ticker import PercentFormatter
 from pandas.api.types import is_numeric_dtype
 from scipy.stats import chi2_contingency
@@ -93,14 +94,14 @@ FIG_DEFAULTS = dict(
 # Friendly label map for R coefficient names → publication names
 LABEL_MAP: Dict[str, str] = {
     "implant_index_cat2":          "Implant sequence: 2nd",
-    "implant_index_cat3+":         "Implant sequence: 3rd or 4th+",
+    "implant_index_cat3+":         "Implant sequence: 3rd or later",
     "gender1":                     "Sex: Male",
     "gender1.0":                   "Sex: Male",
     "gendermale":                  "Sex: Male",
     "smoker":                      "Smoking (yes)",
     "has_diabetes":                "Diabetes (yes)",
     "has_hypertension":            "Hypertension (yes)",
-    "takes_biphos":                "ARD use (yes)",
+    "takes_biphos":                "Anti-resorptive drug use (yes)",
     "Penicillin_Allergy":          "Penicillin allergy (yes)",
     "length_catShort (<10)":       "Implant length: Short (<10 mm)",
     "length_catLong (>11.5)":      "Implant length: Long (>11.5 mm)",
@@ -127,7 +128,7 @@ VARIABLE_LABELS: Dict[str, str] = {
     "smoker": "Smoking",
     "has_diabetes": "Diabetes",
     "has_hypertension": "Hypertension",
-    "takes_biphos": "ARD use",
+    "takes_biphos": "Anti-resorptive drug use",
     "Penicillin_Allergy": "Penicillin allergy",
     "has_bonegraft_beforeimplant": "Bone graft before implant",
     "has_rama_onimplantday": "Rama on implant day",
@@ -170,14 +171,14 @@ FOREST_GROUP_ORDER = [
 
 FOREST_TERM_ORDER = {
     "Implant sequence: 2nd": 1,
-    "Implant sequence: 3rd or 4th+": 2,
+    "Implant sequence: 3rd or later": 2,
     "Sex: Male": 10,
     "Age group: <40 yr": 11,
     "Age group: ≥60 yr": 12,
     "Smoking (yes)": 20,
     "Diabetes (yes)": 21,
     "Hypertension (yes)": 22,
-    "ARD use (yes)": 23,
+    "Anti-resorptive drug use (yes)": 23,
     "Penicillin allergy (yes)": 24,
     "Implant length: Short (<10 mm)": 30,
     "Implant length: Long (>11.5 mm)": 31,
@@ -248,6 +249,39 @@ def sig_stars(p: float) -> str:
     if p < 0.05:
         return "*"
     return ""
+
+
+def _format_hr_ci(hr: float, ci_lower: float, ci_upper: float) -> str:
+    return f"{hr:.2f} ({ci_lower:.2f}–{ci_upper:.2f})"
+
+
+def _format_count(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    return f"{int(value):,}"
+
+
+def _publication_text(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    replacements = {
+        "3+": "3rd or later",
+        "60+": "≥60",
+        "ARD use": "Anti-resorptive drug use",
+        "ARD use (yes)": "Anti-resorptive drug use (yes)",
+        "Implant sequence: 3rd or 4th+": "Implant sequence: 3rd or later",
+        "Reference": "Ref.",
+    }
+    return replacements.get(text, text)
+
+
+def _is_univariable_header_row(row: pd.Series) -> bool:
+    return (
+        str(row.get("Variable", "")).strip() != ""
+        and str(row.get("Level", "")).strip() == ""
+        and pd.isna(row.get("N"))
+    )
 
 
 def _clean_label(raw: str) -> str:
@@ -345,7 +379,7 @@ def _forest_group(label: str) -> str:
         return "Implant Sequence"
     if label.startswith("Sex") or label.startswith("Age group"):
         return "Demographics"
-    if label.startswith(("Smoking", "Diabetes", "Hypertension", "ARD use", "Penicillin allergy")):
+    if label.startswith(("Smoking", "Diabetes", "Hypertension", "ARD use", "Anti-resorptive drug use", "Penicillin allergy")):
         return "Medical History"
     if label.startswith(("Implant length", "Implant diameter")):
         return "Implant Geometry"
@@ -481,6 +515,9 @@ def style_table(
 def style_result_table(tbl: pd.DataFrame) -> pd.io.formats.style.Styler:
     """Styled display for model result tables."""
     styler = style_table(tbl)
+    hr_cols = [col for col in ["HR (95% CI)", "Adjusted HR (95% CI)"] if col in tbl.columns]
+    if hr_cols:
+        styler = styler.set_properties(subset=hr_cols, **{"text-align": "right"})
     if "p-value" in tbl.columns:
         styler = styler.set_properties(subset=["p-value"], **{"text-align": "right"})
     if "" in tbl.columns:
@@ -515,12 +552,7 @@ def style_univariable_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
     """Styled display for consolidated univariable log-rank/Cox tables."""
     styler = style_table(df)
     if not df.empty:
-        header_mask = df.apply(
-            lambda row: str(row.get("Variable", "")).strip() != ""
-            and str(row.get("Level", "")).strip() == ""
-            and pd.isna(row.get("N")),
-            axis=1,
-        )
+        header_mask = df.apply(_is_univariable_header_row, axis=1)
         styler = styler.apply(
             lambda row: [
                 (
@@ -535,19 +567,55 @@ def style_univariable_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
             ],
             axis=1,
         )
-    if "Cox HR (95% CI)" in df.columns:
-        styler = styler.set_properties(subset=["Cox HR (95% CI)"], **{"text-align": "right"})
-    if "Log-rank p-value" in df.columns:
-        styler = styler.set_properties(subset=["Log-rank p-value", "Cox p-value"], **{"text-align": "right"})
+    numeric_like_cols = [
+        col for col in [
+            "N", "Events", "Success rate (%)",
+            "Cox HR (95% CI)", "Log-rank p-value", "Cox p-value",
+        ] if col in df.columns
+    ]
+    if numeric_like_cols:
+        styler = styler.set_properties(subset=numeric_like_cols, **{"text-align": "right"})
     if "Cox HR (95% CI)" in df.columns:
         styler = styler.apply(
             lambda s: [
-                "font-style: italic; color: #556270" if str(v) == "Reference" else ""
+                "font-style: italic; color: #556270" if str(v) in {"Reference", "Ref."} else ""
                 for v in s
             ],
             subset=["Cox HR (95% CI)"],
         )
     return styler
+
+
+def make_univariable_publication_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Return an export-friendly manuscript version of the univariable summary table."""
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+    header_mask = out.apply(_is_univariable_header_row, axis=1)
+
+    out["Variable"] = out["Variable"].apply(_publication_text)
+    out["Level"] = out["Level"].apply(_publication_text)
+    out["Cox HR (95% CI)"] = out["Cox HR (95% CI)"].apply(_publication_text)
+
+    for col in ["Log-rank p-value", "Cox p-value"]:
+        if col in out.columns:
+            out[col] = out[col].apply(lambda value: fmt_p(value) if isinstance(value, (int, float, np.integer, np.floating)) else str(value).strip())
+            out.loc[header_mask, col] = ""
+
+    out["N"] = out["N"].apply(_format_count)
+    out["Events"] = out["Events"].apply(_format_count)
+    out["Success rate (%)"] = out["Success rate (%)"].apply(
+        lambda value: "" if pd.isna(value) else f"{float(value):.1f}"
+    )
+
+    out.loc[header_mask, ["N", "Events", "Success rate (%)", "Cox HR (95% CI)"]] = ""
+    return out
+
+
+def style_univariable_publication_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    """Styled display for the manuscript-ready univariable table."""
+    return style_univariable_table(df)
 
 
 def style_comparison_table(df: pd.DataFrame) -> pd.io.formats.style.Styler:
@@ -1119,6 +1187,31 @@ def result_table(
     return tbl
 
 
+def result_table_publication(
+    res_df: pd.DataFrame,
+    n_obs: int,
+    n_events: int,
+    concordance: float,
+    ph_global_p: float,
+    model_label: str = "Andersen–Gill Cox Model",
+) -> pd.DataFrame:
+    """Return a manuscript-ready multivariable Cox table."""
+    base = result_table(
+        res_df,
+        n_obs,
+        n_events,
+        concordance,
+        ph_global_p,
+        model_label=model_label,
+    )
+    out = base[["Variable", "HR (95% CI)", "p-value"]].copy()
+    out.columns = ["Variable", "Adjusted HR (95% CI)", "p-value"]
+    out["Variable"] = out["Variable"].apply(_publication_text)
+    out["Adjusted HR (95% CI)"] = out["Adjusted HR (95% CI)"].apply(_publication_text)
+    out.attrs.update(base.attrs)
+    return out
+
+
 def result_table_html(
     tbl: pd.DataFrame,
     model_label: str = "Andersen–Gill Cox Model",
@@ -1202,35 +1295,7 @@ def forest_plot(
     """
     _apply_jcp_style()
 
-    fp = res_df.copy()
-    fp["is_sig"] = fp["p_value"] < 0.05
-    fp["log_HR"] = np.log(fp["HR"])
-    fp["log_lower"] = np.log(fp["CI_lower"])
-    fp["log_upper"] = np.log(fp["CI_upper"])
-    fp["group"] = fp["label"].apply(_forest_group)
-    fp["sort_key"] = fp["label"].apply(_forest_order)
-
-    fp = fp.sort_values("sort_key").reset_index(drop=True)
-
-    grouped_rows = []
-    for group in FOREST_GROUP_ORDER:
-        grp = fp[fp["group"] == group].copy()
-        if grp.empty:
-            continue
-        grouped_rows.append(pd.DataFrame([{
-            "row_type": "header",
-            "label": group,
-            "HR": np.nan,
-            "log_HR": np.nan,
-            "log_lower": np.nan,
-            "log_upper": np.nan,
-            "p_fmt": "",
-            "is_sig": False,
-        }]))
-        grp["row_type"] = "data"
-        grouped_rows.append(grp)
-
-    fp_plot = pd.concat(grouped_rows, ignore_index=True)
+    fp_plot = _prepare_forest_plot_data(res_df)
 
     n = len(fp_plot)
     fig_height = max(5.5, n * 0.42 + 1.6)
@@ -1304,6 +1369,140 @@ def forest_plot(
     ns_patch = mpatches.Patch(color=ns_c, label="p ≥ 0.05")
     ax.legend(handles=[sig_patch, ns_patch], loc="lower right", framealpha=0.95,
               facecolor="white", edgecolor=FIG_DEFAULTS["border_color"])
+
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    fig.tight_layout()
+
+    if save_path:
+        for ext in ("png", "pdf"):
+            fig.savefig(f"{save_path}.{ext}", dpi=FIG_DEFAULTS["dpi"], bbox_inches="tight")
+        print(f"  Saved: {save_path}.png / .pdf")
+
+    return fig
+
+
+def _prepare_forest_plot_data(res_df: pd.DataFrame) -> pd.DataFrame:
+    fp = res_df.copy()
+    fp["label"] = fp["label"].apply(_publication_text)
+    fp["HR_str"] = fp.apply(
+        lambda row: row["HR_str"] if "HR_str" in fp.columns and pd.notna(row.get("HR_str")) else _format_hr_ci(row["HR"], row["CI_lower"], row["CI_upper"]),
+        axis=1,
+    )
+    fp["p_fmt"] = fp["p_value"].apply(fmt_p)
+    fp["is_sig"] = fp["p_value"] < 0.05
+    fp["log_HR"] = np.log(fp["HR"])
+    fp["log_lower"] = np.log(fp["CI_lower"])
+    fp["log_upper"] = np.log(fp["CI_upper"])
+    fp["group"] = fp["label"].apply(_forest_group)
+    fp["sort_key"] = fp["label"].apply(_forest_order)
+    fp = fp.sort_values("sort_key").reset_index(drop=True)
+
+    grouped_rows = []
+    for group in FOREST_GROUP_ORDER:
+        grp = fp[fp["group"] == group].copy()
+        if grp.empty:
+            continue
+        grouped_rows.append(pd.DataFrame([{
+            "row_type": "header",
+            "label": group,
+            "HR": np.nan,
+            "HR_str": "",
+            "log_HR": np.nan,
+            "log_lower": np.nan,
+            "log_upper": np.nan,
+            "p_fmt": "",
+            "is_sig": False,
+        }]))
+        grp["row_type"] = "data"
+        grouped_rows.append(grp)
+
+    return pd.concat(grouped_rows, ignore_index=True)
+
+
+def forest_plot_journal(
+    res_df: pd.DataFrame,
+    n_obs: int,
+    n_events: int,
+    concordance: float,
+    model_label: str = "Andersen–Gill Cox Model",
+    save_path: Optional[str] = None,
+    figsize_width: float = 8.5,
+) -> matplotlib.figure.Figure:
+    """Manuscript-ready monochrome forest plot for journal submission."""
+    _apply_jcp_style()
+
+    fp_plot = _prepare_forest_plot_data(res_df)
+    n = len(fp_plot)
+    fig_height = max(5.2, n * 0.34 + 1.4)
+    fig, ax = plt.subplots(figsize=(figsize_width, fig_height))
+    fig.subplots_adjust(right=0.78)
+
+    data_rows = fp_plot[fp_plot["row_type"] == "data"]
+    x_min = min(data_rows["log_lower"].min() - 0.2, np.log(0.25))
+    x_max = max(data_rows["log_upper"].max() + 0.2, np.log(8))
+
+    ax.axvline(0, color="#404040", linewidth=0.9, linestyle="-", zorder=1)
+
+    for i, row in fp_plot.iterrows():
+        if row["row_type"] != "data":
+            continue
+        ax.plot([row["log_lower"], row["log_upper"]], [i, i], color="#404040", linewidth=1.1, zorder=2)
+        ax.plot(row["log_HR"], i, marker="s", markersize=5, color="#202020", zorder=3)
+
+    hr_ticks = [0.25, 0.5, 1, 2, 4, 8]
+    ax.set_xticks(np.log(hr_ticks))
+    ax.set_xticklabels([str(h) for h in hr_ticks])
+    ax.set_xlim(x_min, x_max)
+
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(fp_plot["label"])
+    ax.set_ylim(n - 0.2, -0.8)
+    ax.tick_params(axis="y", length=0)
+
+    text_transform = transforms.blended_transform_factory(ax.transAxes, ax.transData)
+    for i, row in fp_plot.iterrows():
+        if row["row_type"] != "data":
+            continue
+        ax.text(
+            1.02,
+            i,
+            f"{row['HR_str']}  {row['p_fmt']}",
+            transform=text_transform,
+            va="center",
+            ha="left",
+            fontsize=7.3,
+            color="#202020",
+            clip_on=False,
+        )
+    ax.text(
+        1.02,
+        -0.55,
+        "HR (95% CI)     p-value",
+        transform=text_transform,
+        va="center",
+        ha="left",
+        fontsize=7.6,
+        fontweight="bold",
+        color="#202020",
+        clip_on=False,
+    )
+
+    for tick, row_type in zip(ax.get_yticklabels(), fp_plot["row_type"]):
+        if row_type == "header":
+            tick.set_fontweight("bold")
+            tick.set_color("#202020")
+
+    ax.set_xlabel("Hazard ratio (log scale)")
+    ax.set_title(
+        f"{model_label}\n"
+        f"N = {n_obs:,} implants · {n_events:,} events · C-index = {concordance:.3f}",
+        fontweight="bold",
+        color="#202020",
+        pad=8,
+    )
+    ax.grid(axis="x", color="#D5D5D5", linewidth=0.6)
 
     for spine in ["top", "right"]:
         ax.spines[spine].set_visible(False)
