@@ -1,5 +1,5 @@
 *
 !*/
 !.gitignore
-!ag_complete_analysis\analysis.ipynb
-!ag_complete_analysis\functions.py
+!ag_complete_analysis/analysis.ipynb
+!ag_complete_analysis/functions.py
