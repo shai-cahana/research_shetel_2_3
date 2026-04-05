@@ -1596,6 +1596,477 @@ def km_plot_by_group(
     return fig
 
 
+def compute_followup_time(
+    df: pd.DataFrame,
+    study_end: str = "2023-12-31",
+    start_col: str = "duedate",
+    event_date_col: str = "failure_date",
+    event_col: str = "is_failure",
+) -> pd.DataFrame:
+    """Return a copy with internally consistent follow-up time columns."""
+    out = df.copy()
+    out[start_col] = pd.to_datetime(out[start_col], errors="coerce")
+    out[event_date_col] = pd.to_datetime(out[event_date_col], errors="coerce")
+    out[event_col] = pd.to_numeric(out[event_col], errors="coerce").fillna(0).astype(int)
+
+    study_end_ts = pd.to_datetime(study_end)
+    followup_end = out[event_date_col].where(out[event_col].eq(1), study_end_ts)
+    out["followup_end_date"] = pd.to_datetime(followup_end, errors="coerce")
+    out["followup_days"] = (out["followup_end_date"] - out[start_col]).dt.days
+    out.loc[out["followup_days"] < 0, "followup_days"] = np.nan
+    out["followup_years"] = out["followup_days"] / 365.25
+    out["reverse_km_event"] = 1 - out[event_col]
+    return out
+
+
+def _build_survival_plot_data(
+    df: pd.DataFrame,
+    duration_col: str,
+    event_col: str,
+    group_col: str,
+) -> pd.DataFrame:
+    valid = df[[duration_col, event_col, group_col]].copy()
+    valid[duration_col] = pd.to_numeric(valid[duration_col], errors="coerce")
+    valid[event_col] = pd.to_numeric(valid[event_col], errors="coerce").fillna(0).astype(int)
+    valid = valid.dropna(subset=[duration_col, group_col])
+    valid = valid[valid[duration_col] >= 0].copy()
+    return valid
+
+
+def _resolve_group_maps(
+    groups: List[object],
+    label_map: Optional[dict] = None,
+    color_map: Optional[dict] = None,
+) -> Tuple[dict, dict]:
+    sorted_groups = sorted(groups)
+    if label_map is None:
+        label_map = {g: str(g) for g in sorted_groups}
+    if color_map is None:
+        palette = list(WONG.values())
+        color_map = {g: palette[i % len(palette)] for i, g in enumerate(sorted_groups)}
+    return label_map, color_map
+
+
+def _plot_survival_curves_on_axis(
+    df: pd.DataFrame,
+    ax: matplotlib.axes.Axes,
+    duration_col: str,
+    event_col: str,
+    group_col: str,
+    label_map: Optional[dict] = None,
+    color_map: Optional[dict] = None,
+    title: str = "Kaplan-Meier Survival Estimate",
+    ylabel: str = "Survival probability",
+    reverse: bool = False,
+    x_cap: Optional[float] = None,
+) -> Tuple[List[KaplanMeierFitter], pd.DataFrame, np.ndarray, float]:
+    """Plot grouped KM-style curves onto an existing axis."""
+    if not HAS_LIFELINES:
+        raise ImportError("lifelines is required for KM plots.")
+
+    valid = _build_survival_plot_data(df, duration_col, event_col, group_col)
+    label_map, color_map = _resolve_group_maps(valid[group_col].unique().tolist(), label_map, color_map)
+
+    ax.set_facecolor("white")
+    fitters = []
+    sorted_groups = sorted(valid[group_col].unique())
+    for grp in sorted_groups:
+        gdf = valid[valid[group_col] == grp]
+        kmf = KaplanMeierFitter()
+        kmf.fit(gdf[duration_col], gdf[event_col], label=label_map.get(grp, str(grp)))
+        kmf.plot_survival_function(
+            ax=ax,
+            ci_show=True,
+            ci_alpha=0.15,
+            color=color_map.get(grp, "#333333"),
+            linewidth=1.8,
+        )
+        fitters.append(kmf)
+
+    if x_cap is None:
+        x_cap = min(10.0, float(valid[duration_col].max())) if not valid.empty else 10.0
+    xticks = np.arange(0, np.floor(x_cap) + 1, 1) if x_cap > 0 else np.array([0.0])
+
+    ax.set_xlabel("Years")
+    ax.set_ylabel(ylabel)
+    ax.yaxis.set_major_formatter(PercentFormatter(xmax=1, decimals=0))
+    ax.set_title(title, color=FIG_DEFAULTS["title_color"], pad=10)
+    ax.grid(True, color=FIG_DEFAULTS["grid_color"], alpha=0.6)
+    ax.legend(loc="lower left", framealpha=0.95, facecolor="white", edgecolor=FIG_DEFAULTS["border_color"])
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    if x_cap > 0:
+        ax.set_xlim(0, x_cap)
+        if len(xticks) > 1:
+            ax.set_xticks(xticks)
+
+    if valid[group_col].nunique() >= 2:
+        lr = multivariate_logrank_test(valid[duration_col], valid[group_col], valid[event_col])
+        label = "Reverse log-rank" if reverse else "Log-rank"
+        ax.text(
+            0.98,
+            0.03,
+            f"{label} p = {fmt_p(lr.p_value)}",
+            transform=ax.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=8,
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=FIG_DEFAULTS["border_color"], alpha=0.9),
+        )
+        p_value = float(lr.p_value)
+    else:
+        p_value = np.nan
+
+    return fitters, valid, xticks, p_value
+
+
+def _at_risk_count(kmf: KaplanMeierFitter, time_point: float) -> int:
+    event_table = kmf.event_table[["at_risk"]].reset_index()
+    timeline = event_table.iloc[:, 0].to_numpy(dtype=float)
+    at_risk = event_table["at_risk"].to_numpy(dtype=float)
+    idx = np.searchsorted(timeline, float(time_point), side="right") - 1
+    if idx < 0:
+        return int(at_risk[0]) if len(at_risk) else 0
+    return int(at_risk[idx])
+
+
+def draw_km_risk_table(
+    ax: matplotlib.axes.Axes,
+    fitters: List[KaplanMeierFitter],
+    xticks: np.ndarray,
+    color_map: Optional[dict] = None,
+) -> None:
+    """Draw a compact at-risk table on a dedicated axis."""
+    ax.axis("off")
+    if not fitters:
+        return
+
+    labels = [fitter._label for fitter in fitters]
+    if color_map is None:
+        color_map = {label: "#333333" for label in labels}
+
+    n_rows = len(fitters)
+    ax.set_xlim(-1.4, max(len(xticks) - 0.2, 1))
+    ax.set_ylim(-0.8, n_rows + 0.8)
+
+    ax.text(-1.35, n_rows + 0.2, "At risk", ha="left", va="center", fontsize=8, fontweight="bold")
+    for col_idx, tick in enumerate(xticks):
+        ax.text(col_idx, n_rows + 0.2, f"{int(tick)}", ha="center", va="center", fontsize=8, fontweight="bold")
+
+    for row_idx, fitter in enumerate(fitters):
+        y = n_rows - 1 - row_idx
+        label = fitter._label
+        ax.text(-1.35, y, label, ha="left", va="center", fontsize=8, color=color_map.get(label, "#333333"))
+        for col_idx, tick in enumerate(xticks):
+            ax.text(col_idx, y, f"{_at_risk_count(fitter, tick):,}", ha="center", va="center", fontsize=8)
+
+
+def km_time_at_risk_table(
+    df: pd.DataFrame,
+    duration_col: str = "years_to_failure",
+    event_col: str = "is_failure",
+    group_col: str = "implant_group",
+    label_map: Optional[dict] = None,
+    x_cap: Optional[float] = None,
+) -> pd.DataFrame:
+    """Return a standalone time-at-risk table for grouped KM curves."""
+    if not HAS_LIFELINES:
+        raise ImportError("lifelines is required for KM plots.")
+
+    valid = _build_survival_plot_data(df, duration_col, event_col, group_col)
+    label_map, _ = _resolve_group_maps(valid[group_col].unique().tolist(), label_map, None)
+
+    if x_cap is None:
+        x_cap = min(10.0, float(valid[duration_col].max())) if not valid.empty else 10.0
+    xticks = np.arange(0, np.floor(x_cap) + 1, 1) if x_cap > 0 else np.array([0.0])
+
+    rows = []
+    for grp in sorted(valid[group_col].unique()):
+        gdf = valid[valid[group_col] == grp]
+        kmf = KaplanMeierFitter()
+        kmf.fit(gdf[duration_col], gdf[event_col], label=label_map.get(grp, str(grp)))
+
+        row = {"Group": label_map.get(grp, str(grp))}
+        for tick in xticks:
+            row[f"{int(tick)} years"] = _at_risk_count(kmf, tick)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def _km_time_at_survival_probability(kmf: KaplanMeierFitter, survival_probability: float) -> float:
+    """Return the earliest time where KM survival drops to or below a target level."""
+    sf = kmf.survival_function_.reset_index()
+    time_col, surv_col = sf.columns[:2]
+    crossed = sf[sf[surv_col] <= float(survival_probability)]
+    if crossed.empty:
+        return np.nan
+    return float(crossed.iloc[0][time_col])
+
+
+def reverse_km_followup_summary(
+    df: pd.DataFrame,
+    study_end: str = "2023-12-31",
+    group_col: str = "implant_group",
+    event_col: str = "is_failure",
+    label_map: Optional[dict] = None,
+) -> pd.DataFrame:
+    """Return potential follow-up summaries by group using reverse Kaplan-Meier."""
+    if not HAS_LIFELINES:
+        raise ImportError("lifelines is required for KM plots.")
+
+    combined = compute_followup_time(df, study_end=study_end, event_col=event_col)
+    valid = _build_survival_plot_data(combined, "followup_years", "reverse_km_event", group_col)
+    label_map, _ = _resolve_group_maps(valid[group_col].unique().tolist(), label_map, None)
+
+    rows = []
+    for grp in sorted(valid[group_col].unique()):
+        gdf = valid[valid[group_col] == grp].copy()
+        kmf = KaplanMeierFitter()
+        kmf.fit(gdf["followup_years"], gdf["reverse_km_event"], label=label_map.get(grp, str(grp)))
+
+        q25 = _km_time_at_survival_probability(kmf, 0.75)
+        q50 = _km_time_at_survival_probability(kmf, 0.50)
+        q75 = _km_time_at_survival_probability(kmf, 0.25)
+
+        rows.append({
+            "Group": label_map.get(grp, str(grp)),
+            "N": len(gdf),
+            "Observed failures": int(pd.to_numeric(combined.loc[gdf.index, event_col], errors="coerce").fillna(0).sum()),
+            "Administratively censored": int((1 - pd.to_numeric(combined.loc[gdf.index, event_col], errors="coerce").fillna(0)).sum()),
+            "25th percentile FU (yr)": np.nan if pd.isna(q25) else round(q25, 2),
+            "Median potential FU (yr)": np.nan if pd.isna(q50) else round(q50, 2),
+            "75th percentile FU (yr)": np.nan if pd.isna(q75) else round(q75, 2),
+            "Max observed FU (yr)": round(float(gdf["followup_years"].max()), 2),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def _annotate_reverse_km_medians(
+    ax: matplotlib.axes.Axes,
+    summary_df: pd.DataFrame,
+    label_map: dict,
+    color_map: dict,
+) -> None:
+    """Draw vertical median potential follow-up lines for each group on the plot."""
+    if summary_df.empty or "Median potential FU (yr)" not in summary_df.columns:
+        return
+
+    display_order = [label_map.get(key, str(key)) for key in sorted(label_map)]
+    annotation_levels = [0.24, 0.16, 0.08, 0.32]
+    level_idx = 0
+    last_x = None
+    for group_label in display_order:
+        row = summary_df[summary_df["Group"] == group_label]
+        if row.empty:
+            continue
+        median_value = row["Median potential FU (yr)"].iloc[0]
+        color_key = next((key for key, value in label_map.items() if value == group_label), group_label)
+        color = color_map.get(color_key, "#333333")
+        if pd.isna(median_value):
+            continue
+        if last_x is not None and abs(float(median_value) - last_x) < 0.6:
+            level_idx += 1
+        else:
+            level_idx = 0
+        annotation_y = annotation_levels[level_idx % len(annotation_levels)]
+        ax.axvline(float(median_value), color=color, linestyle="--", linewidth=1.1, alpha=0.9, zorder=1)
+        ax.text(
+            float(median_value),
+            annotation_y,
+            f"{group_label}\n{median_value:.2f} y",
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="bottom",
+            fontsize=7.2,
+            color=color,
+            bbox=dict(boxstyle="round,pad=0.18", fc="white", ec="none", alpha=0.85),
+        )
+        last_x = float(median_value)
+
+
+def summarize_followup_bins(
+    df: pd.DataFrame,
+    group_col: str = "implant_group",
+    followup_col: str = "followup_years",
+    allowed_groups: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """Count implants by follow-up duration bins within each implant group."""
+    bins = [-np.inf, 1, 3, 5, np.inf]
+    labels = ["<=1 year", ">1-3 years", ">3-5 years", ">5 years"]
+
+    tmp = df[[group_col, followup_col]].copy()
+    tmp[followup_col] = pd.to_numeric(tmp[followup_col], errors="coerce")
+    tmp = tmp.dropna(subset=[group_col, followup_col])
+    if allowed_groups is not None:
+        tmp = tmp[tmp[group_col].astype(str).isin(allowed_groups)].copy()
+
+    tmp["followup_bin"] = pd.cut(tmp[followup_col], bins=bins, labels=labels, right=True)
+    summary = (
+        tmp.groupby([group_col, "followup_bin"], observed=False)
+        .size()
+        .rename("count")
+        .reset_index()
+    )
+    totals = summary.groupby(group_col)["count"].transform("sum")
+    summary["percent"] = np.where(totals.gt(0), summary["count"] / totals * 100, np.nan)
+    return summary
+
+
+def plot_followup_bin_summary(
+    summary_df: pd.DataFrame,
+    ax: matplotlib.axes.Axes,
+    label_map: Optional[dict] = None,
+    color_map: Optional[dict] = None,
+    title: str = "Follow-up duration categories",
+) -> None:
+    """Plot grouped bars summarizing recurrent-implant follow-up bins."""
+    if summary_df.empty:
+        ax.axis("off")
+        return
+
+    groups = sorted(summary_df.iloc[:, 0].astype(str).unique())
+    label_map, color_map = _resolve_group_maps(groups, label_map, color_map)
+    bin_order = ["<=1 year", ">1-3 years", ">3-5 years", ">5 years"]
+    pivot = (
+        summary_df.assign(_group=summary_df.iloc[:, 0].astype(str))
+        .pivot(index="followup_bin", columns="_group", values="count")
+        .reindex(bin_order)
+        .fillna(0)
+    )
+
+    x = np.arange(len(pivot.index))
+    width = 0.36
+    offsets = np.linspace(-width / 2, width / 2, num=len(groups)) if len(groups) > 1 else np.array([0.0])
+
+    for offset, grp in zip(offsets, groups):
+        heights = pivot[grp].to_numpy(dtype=float) if grp in pivot.columns else np.zeros(len(pivot.index))
+        bars = ax.bar(
+            x + offset,
+            heights,
+            width=width / max(len(groups), 1) * 1.8,
+            label=label_map.get(grp, str(grp)),
+            color=color_map.get(grp, "#333333"),
+            alpha=0.9,
+        )
+        for bar, value in zip(bars, heights):
+            if value > 0:
+                ax.text(bar.get_x() + bar.get_width() / 2, value + 0.15, f"{int(value)}", ha="center", va="bottom", fontsize=7)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(bin_order)
+    ax.set_ylabel("Number of implants")
+    ax.set_title(title, color=FIG_DEFAULTS["title_color"], pad=8)
+    ax.grid(axis="y", color=FIG_DEFAULTS["grid_color"], alpha=0.6)
+    ax.legend(loc="upper right", framealpha=0.95, facecolor="white", edgecolor=FIG_DEFAULTS["border_color"])
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+
+def plot_implant_sequence_survival_followup_figure(
+    df: pd.DataFrame,
+    save_path: Optional[str] = None,
+    study_end: str = "2023-12-31",
+    duration_col: str = "years_to_failure",
+    event_col: str = "is_failure",
+    group_col: str = "implant_group",
+    label_map: Optional[dict] = None,
+    color_map: Optional[dict] = None,
+) -> matplotlib.figure.Figure:
+    """Create a combined figure with panel A reverse KM and panel B KM."""
+    if not HAS_LIFELINES:
+        raise ImportError("lifelines is required for KM plots.")
+
+    _apply_jcp_style()
+    combined = compute_followup_time(df, study_end=study_end, event_col=event_col)
+    label_map, color_map = _resolve_group_maps(
+        combined[group_col].dropna().astype(str).unique().tolist(),
+        label_map,
+        color_map,
+    )
+
+    fig = plt.figure(figsize=(13.2, 5.4), constrained_layout=True)
+    gs = fig.add_gridspec(
+        nrows=1,
+        ncols=2,
+        width_ratios=[1.1, 1.0],
+        wspace=0.18,
+    )
+
+    ax_a = fig.add_subplot(gs[0, 0])
+    ax_b_curve = fig.add_subplot(gs[0, 1])
+
+    reverse_summary = reverse_km_followup_summary(
+        df,
+        study_end=study_end,
+        group_col=group_col,
+        event_col=event_col,
+        label_map=label_map,
+    )
+
+    _plot_survival_curves_on_axis(
+        combined,
+        ax=ax_a,
+        duration_col="followup_years",
+        event_col="reverse_km_event",
+        group_col=group_col,
+        label_map=label_map,
+        color_map=color_map,
+        title="Reverse Kaplan-Meier follow-up by implant sequence",
+        ylabel="Probability of remaining under follow-up",
+        reverse=True,
+        x_cap=10.0,
+    )
+    _annotate_reverse_km_medians(ax_a, reverse_summary, label_map, color_map)
+    ax_a.text(
+        -0.12,
+        1.04,
+        "A",
+        transform=ax_a.transAxes,
+        ha="left",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+        color=FIG_DEFAULTS["title_color"],
+        clip_on=False,
+    )
+
+    _plot_survival_curves_on_axis(
+        combined,
+        ax=ax_b_curve,
+        duration_col=duration_col,
+        event_col=event_col,
+        group_col=group_col,
+        label_map=label_map,
+        color_map=color_map,
+        title="Kaplan-Meier survival by implant sequence",
+        ylabel="Survival probability",
+        reverse=False,
+        x_cap=10.0,
+    )
+    ax_b_curve.text(
+        -0.12,
+        1.04,
+        "B",
+        transform=ax_b_curve.transAxes,
+        ha="left",
+        va="top",
+        fontsize=12,
+        fontweight="bold",
+        color=FIG_DEFAULTS["title_color"],
+        clip_on=False,
+    )
+
+    if save_path:
+        for ext in ("png", "pdf"):
+            fig.savefig(f"{save_path}.{ext}", dpi=FIG_DEFAULTS["dpi"], bbox_inches="tight")
+        print(f"  Saved: {save_path}.png / .pdf")
+
+    return fig
+
+
 # =====================================================================
 #  X. DESCRIPTIVE / EDA TABLES
 # =====================================================================
